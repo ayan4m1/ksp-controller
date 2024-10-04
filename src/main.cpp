@@ -33,10 +33,10 @@
 #define TOTAL_POSITIONS 5
 #define TOTAL_STICKS 2
 
-#define CHANNEL_X1 1
-#define CHANNEL_X2 3
-#define CHANNEL_Y1 0
-#define CHANNEL_Y2 2
+#define CHANNEL_X1 0
+#define CHANNEL_X2 2
+#define CHANNEL_Y1 1
+#define CHANNEL_Y2 3
 
 #define POSITION_TOP 0
 #define POSITION_RIGHT 1
@@ -88,8 +88,8 @@ int16_t channelValues[ADC_CHANNELS];
 volatile uint8_t channel = 0;
 
 bool calibrated = false;
-volatile bool calibrating = false;
-volatile bool waitingForButtonPress = true;
+bool calibrating = false;
+bool waitingForButtonPress = true;
 
 srect16 bounds[TOTAL_STICKS] = {srect16(0, 0, 0, 0), srect16(0, 0, 0, 0)};
 spoint16 centers[TOTAL_STICKS];
@@ -105,19 +105,17 @@ uint32_t startTime;
 Button2 calibrateBtn;
 
 void pressCalibration(Button2 &btn) {
-  if (!calibrating) {
+  if (!calibrated && !calibrating) {
     calibrating = true;
-  }
-
-  if (waitingForButtonPress && calibrationPositionIndex < TOTAL_POSITIONS) {
+    adc.startADCReading(muxChannels[calibrationChannelIndex], false);
+  } else if (waitingForButtonPress &&
+             calibrationPositionIndex < TOTAL_POSITIONS) {
     waitingForButtonPress = false;
     calibrationPositionIndex++;
     calibrationChannelIndex = 0;
     calibrationSampleIndex = 0;
 
-    lcd.clear(lcd.bounds());
-    draw::filled_rectangle(lcd, positionRects[calibrationPositionIndex],
-                           lcd_color::white);
+    adc.startADCReading(muxChannels[calibrationChannelIndex], false);
   }
 }
 
@@ -158,7 +156,8 @@ void setup() {
   adc.setGain(GAIN_TWOTHIRDS);
   adc.setDataRate(RATE_ADS1115_860SPS);
 
-  // adc.startADCReading(muxChannels[channel], false);
+  lcd.clear(lcd.bounds());
+  draw::filled_rectangle(lcd, positionRects[0], lcd_color::white);
 }
 
 void loop() {
@@ -167,66 +166,76 @@ void loop() {
   if (calibrating) {
     if (!adc.conversionComplete()) {
       return;
-    } else if (!waitingForButtonPress) {
+    }
+
+    if (!waitingForButtonPress) {
       calibrationSamples[calibrationSampleIndex++] =
           adc.getLastConversionResults();
 
       if (calibrationSampleIndex == TOTAL_CALIBRATION_SAMPLES) {
-        uint32_t average = getCalibrationAverage();
-
         calibrationSampleIndex = 0;
 
         if (calibrationChannelIndex < ADC_CHANNELS) {
-          calibrationValues[calibrationChannelIndex++] = average;
-        } else {
-          if (calibrationPositionIndex == 0) {
-            centers[0] = spoint16(calibrationValues[CHANNEL_X1],
-                                  calibrationValues[CHANNEL_Y1]);
-            centers[1] = spoint16(calibrationValues[CHANNEL_X2],
-                                  calibrationValues[CHANNEL_Y2]);
-          } else {
-            switch (calibrationPositionIndex - 1) {
-              case POSITION_TOP:
-                bounds[0].y1 = calibrationValues[CHANNEL_Y1];
-                bounds[1].y1 = calibrationValues[CHANNEL_Y2];
-                break;
-              case POSITION_RIGHT:
-                bounds[0].x2 = calibrationValues[CHANNEL_X1];
-                bounds[1].x2 = calibrationValues[CHANNEL_X2];
-                break;
-              case POSITION_BOTTOM:
-                bounds[0].y2 = calibrationValues[CHANNEL_Y1];
-                bounds[1].y2 = calibrationValues[CHANNEL_Y2];
-                break;
-              case POSITION_LEFT:
-                bounds[0].x1 = calibrationValues[CHANNEL_X1];
-                bounds[1].x1 = calibrationValues[CHANNEL_X2];
-                break;
-            }
+          calibrationValues[calibrationChannelIndex++] =
+              getCalibrationAverage();
+        } else if (calibrationPositionIndex == 0) {
+          centers[0] = spoint16(calibrationValues[CHANNEL_X1],
+                                calibrationValues[CHANNEL_Y1]);
+          centers[1] = spoint16(calibrationValues[CHANNEL_X2],
+                                calibrationValues[CHANNEL_Y2]);
+          waitingForButtonPress = true;
+          lcd.clear(lcd.bounds());
+          draw::filled_rectangle(lcd,
+                                 positionRects[calibrationPositionIndex + 1],
+                                 lcd_color::white);
+        } else if (calibrationPositionIndex < TOTAL_POSITIONS) {
+          switch (calibrationPositionIndex - 1) {
+            case POSITION_TOP:
+              bounds[0].y1 = calibrationValues[CHANNEL_Y1];
+              bounds[1].y1 = calibrationValues[CHANNEL_Y2];
+              Serial.printf("T1:%d T2:%d\n", bounds[0].y1, bounds[1].y1);
+              break;
+            case POSITION_RIGHT:
+              bounds[0].x2 = calibrationValues[CHANNEL_X1];
+              bounds[1].x2 = calibrationValues[CHANNEL_X2];
+              Serial.printf("R1:%d R2:%d\n", bounds[0].x2, bounds[1].x2);
+              break;
+            case POSITION_BOTTOM:
+              bounds[0].y2 = calibrationValues[CHANNEL_Y1];
+              bounds[1].y2 = calibrationValues[CHANNEL_Y2];
+              Serial.printf("B1:%d B2:%d\n", bounds[0].y2, bounds[1].y2);
+              break;
+            case POSITION_LEFT:
+              bounds[0].x1 = calibrationValues[CHANNEL_X1];
+              bounds[1].x1 = calibrationValues[CHANNEL_X2];
+              Serial.printf("L1:%d L2:%d\n", bounds[0].x1, bounds[1].x1);
+              break;
           }
+          waitingForButtonPress = true;
+          lcd.clear(lcd.bounds());
+          draw::filled_rectangle(lcd,
+                                 positionRects[calibrationPositionIndex + 1],
+                                 lcd_color::white);
+        } else {
+          waitingForButtonPress = false;
+          calibrating = false;
+          calibrated = true;
 
-          if (calibrationPositionIndex == TOTAL_POSITIONS) {
-            calibrating = false;
-            calibrated = true;
-
-            Serial.println(F("!!! Calibration Complete !!!\n"));
-            for (uint8_t i = 0; i < TOTAL_STICKS; i++) {
-              Serial.printf("Stick %d\n", i);
-              Serial.printf("    Center X:%d Y:%d\n", centers[i].x,
-                            centers[i].y);
-              Serial.printf("    Bounds T:%d R:%d B:%d L:%d\n", bounds[i].y1,
-                            bounds[i].x2, bounds[i].y2, bounds[i].x1);
-            }
-          } else {
-            waitingForButtonPress = true;
+          Serial.println(F("!!! Calibration Complete !!!\n"));
+          for (uint8_t i = 0; i < TOTAL_STICKS; i++) {
+            Serial.printf("Stick %d\n", i);
+            Serial.printf("    Center X:%d Y:%d\n", centers[i].x, centers[i].y);
+            Serial.printf("    Bounds T:%d R:%d B:%d L:%d\n", bounds[i].y1,
+                          bounds[i].x2, bounds[i].y2, bounds[i].x1);
           }
         }
       }
 
-      if (!waitingForButtonPress) {
+      if (calibrating && !waitingForButtonPress) {
         adc.startADCReading(muxChannels[calibrationChannelIndex], false);
+      } else if (calibrated) {
+        adc.startADCReading(muxChannels[channel], false);
       }
-      return;
     }
   } else if (calibrated) {
     if (!adc.conversionComplete()) {
