@@ -3,6 +3,8 @@
 #include <Adafruit_ADS1X15.h>
 #include <Arduino.h>
 #include <Button2.h>
+#include <FastLED.h>
+#include <KerbalSimpit.h>
 #include <SPI.h>
 
 #include <gfx_cpp14.hpp>
@@ -23,7 +25,7 @@
 #define ADC_SAMPLE_RATE 860
 #define ADC_CHANNEL_SAMPLE_RATE ADC_SAMPLE_RATE / (ADC_CHANNELS * 1.0f)
 // #define
-#define ADC_I2C_BUS_SPEED_HZ 800000
+#define ADC_I2C_BUS_SPEED_HZ 400000
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define OLED_ROTATION 2
@@ -38,10 +40,18 @@
 #define CHANNEL_Y1 1
 #define CHANNEL_Y2 3
 
+#define INVERT_X1 false
+#define INVERT_X2 false
+#define INVERT_Y1 false
+#define INVERT_Y2 true
+
 #define POSITION_TOP 0
 #define POSITION_RIGHT 1
 #define POSITION_BOTTOM 2
 #define POSITION_LEFT 3
+
+#define STICK_DEADBAND 100
+#define STICK_MAX_VALUE 18000
 
 using namespace arduino;
 using namespace gfx;
@@ -53,16 +63,6 @@ using lcd_color = color<typename lcd_type::pixel_type>;
 
 lcd_type lcd;
 
-/*const srect16 positionRects[TOTAL_POSITIONS] = {
-    srect16(spoint16((lcd.bounds().width() / 2) - 4,
-                     (lcd.bounds().height() / 2) - 4),
-            ssize16(16, 16)),
-    srect16(spoint16(lcd.bounds().top_left()), ssize16(16, 16)),
-    srect16(spoint16(lcd.bounds().top_right().offset(-16, 0)), ssize16(16, 16)),
-    srect16(spoint16(lcd.bounds().bottom_right().offset(-16, -16)),
-            ssize16(16, 16)),
-    srect16(spoint16(lcd.bounds().bottom_left().offset(0, -16)),
-            ssize16(16, 16))};*/
 const uint8_t rectHeight = 8;
 const uint8_t rectWidth = 16;
 const srect16 positionRects[TOTAL_POSITIONS] = {
@@ -84,28 +84,36 @@ const srect16 positionRects[TOTAL_POSITIONS] = {
 uint32_t muxChannels[ADC_CHANNELS] = {
     ADS1X15_REG_CONFIG_MUX_SINGLE_0, ADS1X15_REG_CONFIG_MUX_SINGLE_1,
     ADS1X15_REG_CONFIG_MUX_SINGLE_2, ADS1X15_REG_CONFIG_MUX_SINGLE_3};
-int16_t channelValues[ADC_CHANNELS];
-volatile uint8_t channel = 0;
+int16_t channelValues[ADC_CHANNELS] = {0, 0, 0, 0};
+int16_t previousValues[ADC_CHANNELS] = {0, 0, 0, 0};
+uint8_t channel = 0;
+
+float altitude = 0;
+float surfaceVelocity = 0;
 
 bool calibrated = false;
-bool calibrating = false;
-bool waitingForButtonPress = true;
+bool calibrating = true;
+// bool waitingForButtonPress = true;
 
-srect16 bounds[TOTAL_STICKS] = {srect16(0, 0, 0, 0), srect16(0, 0, 0, 0)};
+// srect16 bounds[TOTAL_STICKS] = {srect16(0, 0, 0, 0), srect16(0, 0, 0, 0)};
 spoint16 centers[TOTAL_STICKS];
 int16_t calibrationValues[ADC_CHANNELS];
 int16_t calibrationSamples[TOTAL_CALIBRATION_SAMPLES];
 // 0 = center, 1-4 = corners
-int8_t calibrationPositionIndex = -1;
+// int8_t calibrationPositionIndex = -1;
 uint8_t calibrationChannelIndex = 0;
 uint16_t calibrationSampleIndex = 0;
 
+KerbalSimpit kerbal(Serial);
 Adafruit_ADS1115 adc;
-uint32_t startTime;
 Button2 calibrateBtn;
 
+int scale(int value) {
+  return map(value, 0, STICK_MAX_VALUE, INT16_MIN, INT16_MAX);
+}
+
 void pressCalibration(Button2 &btn) {
-  if (!calibrated && !calibrating) {
+  /*if (!calibrated && !calibrating) {
     calibrating = true;
     adc.startADCReading(muxChannels[calibrationChannelIndex], false);
   } else if (waitingForButtonPress &&
@@ -116,6 +124,35 @@ void pressCalibration(Button2 &btn) {
     calibrationSampleIndex = 0;
 
     adc.startADCReading(muxChannels[calibrationChannelIndex], false);
+  }*/
+  if (!calibrated && !calibrating) {
+    calibrating = true;
+    adc.startADCReading(muxChannels[calibrationChannelIndex], false);
+  }
+}
+
+void messageHandler(byte messageType, byte message[], byte messageSize) {
+  switch (messageType) {
+    case ALTITUDE_MESSAGE: {
+      if (messageSize != sizeof(altitudeMessage)) {
+        return;
+      }
+
+      altitudeMessage altMsg = parseMessage<altitudeMessage>(message);
+
+      altitude = altMsg.sealevel;
+      break;
+    }
+    case VELOCITY_MESSAGE: {
+      if (messageSize != sizeof(velocityMessage)) {
+        return;
+      }
+
+      velocityMessage velMsg = parseMessage<velocityMessage>(message);
+
+      surfaceVelocity = velMsg.surface;
+      break;
+    }
   }
 }
 
@@ -131,10 +168,18 @@ uint32_t getCalibrationAverage() {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {
-    delay(100);
+  pinMode(LED_BUILTIN, OUTPUT);
+  bool state = false;
+  while (!kerbal.init()) {
+    digitalWrite(LED_BUILTIN, state ? HIGH : LOW);
+    state = !state;
+    delay(500);
   }
-  Serial.println(F("Joystick Demo"));
+
+  kerbal.inboundHandler(messageHandler);
+  kerbal.registerChannel(ALTITUDE_MESSAGE);
+  kerbal.registerChannel(VELOCITY_MESSAGE);
+  kerbal.printToKSP(F("Controller connected!"), PRINT_TO_SCREEN);
 
   lcd.initialize();
   lcd.clear(lcd.bounds());
@@ -156,11 +201,11 @@ void setup() {
   adc.setGain(GAIN_TWOTHIRDS);
   adc.setDataRate(RATE_ADS1115_860SPS);
 
-  lcd.clear(lcd.bounds());
-  draw::filled_rectangle(lcd, positionRects[0], lcd_color::white);
+  adc.startADCReading(muxChannels[channel], false);
 }
 
 void loop() {
+  kerbal.update();
   calibrateBtn.loop();
 
   if (calibrating) {
@@ -168,73 +213,35 @@ void loop() {
       return;
     }
 
-    if (!waitingForButtonPress) {
-      calibrationSamples[calibrationSampleIndex++] =
-          adc.getLastConversionResults();
+    calibrationSamples[calibrationSampleIndex++] =
+        adc.getLastConversionResults();
 
-      if (calibrationSampleIndex == TOTAL_CALIBRATION_SAMPLES) {
-        calibrationSampleIndex = 0;
+    if (calibrationSampleIndex == TOTAL_CALIBRATION_SAMPLES) {
+      calibrationChannelIndex++;
+      calibrationSampleIndex = 0;
 
-        if (calibrationChannelIndex < ADC_CHANNELS) {
-          calibrationValues[calibrationChannelIndex++] =
-              getCalibrationAverage();
-        } else if (calibrationPositionIndex == 0) {
-          centers[0] = spoint16(calibrationValues[CHANNEL_X1],
-                                calibrationValues[CHANNEL_Y1]);
-          centers[1] = spoint16(calibrationValues[CHANNEL_X2],
-                                calibrationValues[CHANNEL_Y2]);
-          waitingForButtonPress = true;
-          lcd.clear(lcd.bounds());
-          draw::filled_rectangle(lcd,
-                                 positionRects[calibrationPositionIndex + 1],
-                                 lcd_color::white);
-        } else if (calibrationPositionIndex < TOTAL_POSITIONS) {
-          switch (calibrationPositionIndex - 1) {
-            case POSITION_TOP:
-              bounds[0].y1 = calibrationValues[CHANNEL_Y1];
-              bounds[1].y1 = calibrationValues[CHANNEL_Y2];
-              Serial.printf("T1:%d T2:%d\n", bounds[0].y1, bounds[1].y1);
-              break;
-            case POSITION_RIGHT:
-              bounds[0].x2 = calibrationValues[CHANNEL_X1];
-              bounds[1].x2 = calibrationValues[CHANNEL_X2];
-              Serial.printf("R1:%d R2:%d\n", bounds[0].x2, bounds[1].x2);
-              break;
-            case POSITION_BOTTOM:
-              bounds[0].y2 = calibrationValues[CHANNEL_Y1];
-              bounds[1].y2 = calibrationValues[CHANNEL_Y2];
-              Serial.printf("B1:%d B2:%d\n", bounds[0].y2, bounds[1].y2);
-              break;
-            case POSITION_LEFT:
-              bounds[0].x1 = calibrationValues[CHANNEL_X1];
-              bounds[1].x1 = calibrationValues[CHANNEL_X2];
-              Serial.printf("L1:%d L2:%d\n", bounds[0].x1, bounds[1].x1);
-              break;
-          }
-          waitingForButtonPress = true;
-          lcd.clear(lcd.bounds());
-          draw::filled_rectangle(lcd,
-                                 positionRects[calibrationPositionIndex + 1],
-                                 lcd_color::white);
-        } else {
-          waitingForButtonPress = false;
-          calibrating = false;
-          calibrated = true;
-
-          Serial.println(F("!!! Calibration Complete !!!\n"));
-          for (uint8_t i = 0; i < TOTAL_STICKS; i++) {
-            Serial.printf("Stick %d\n", i);
-            Serial.printf("    Center X:%d Y:%d\n", centers[i].x, centers[i].y);
-            Serial.printf("    Bounds T:%d R:%d B:%d L:%d\n", bounds[i].y1,
-                          bounds[i].x2, bounds[i].y2, bounds[i].x1);
-          }
-        }
+      switch (calibrationChannelIndex) {
+        case CHANNEL_X1:
+          centers[0].x = getCalibrationAverage();
+          break;
+        case CHANNEL_Y1:
+          centers[0].y = getCalibrationAverage();
+          break;
+        case CHANNEL_X2:
+          centers[1].x = getCalibrationAverage();
+          break;
+        case CHANNEL_Y2:
+          centers[1].y = getCalibrationAverage();
+          break;
       }
 
-      if (calibrating && !waitingForButtonPress) {
-        adc.startADCReading(muxChannels[calibrationChannelIndex], false);
-      } else if (calibrated) {
+      if (calibrationChannelIndex == ADC_CHANNELS) {
+        calibrating = false;
+        calibrated = true;
+        channel = 0;
         adc.startADCReading(muxChannels[channel], false);
+      } else {
+        adc.startADCReading(muxChannels[calibrationChannelIndex], false);
       }
     }
   } else if (calibrated) {
@@ -246,11 +253,56 @@ void loop() {
 
     channelValues[channel++] = result;
     if (channel == ADC_CHANNELS) {
+      channel = 0;
+
+      rotationMessage rotation;
+      translationMessage translation;
+
+      if (channelValues[CHANNEL_Y2] > centers[1].y - STICK_DEADBAND ||
+          channelValues[CHANNEL_Y2] < centers[1].y + STICK_DEADBAND) {
+        rotation.setPitch(scale(channelValues[CHANNEL_Y2]));
+      } else {
+        rotation.setPitch(0);
+      }
+
+      if (channelValues[CHANNEL_X2] > centers[1].x - STICK_DEADBAND ||
+          channelValues[CHANNEL_X2] < centers[1].x + STICK_DEADBAND) {
+        rotation.setYaw(scale(channelValues[CHANNEL_X2]));
+      } else {
+        rotation.setYaw(0);
+      }
+
+      if (channelValues[CHANNEL_Y1] > centers[0].y - STICK_DEADBAND ||
+          channelValues[CHANNEL_Y1] < centers[0].y + STICK_DEADBAND) {
+        translation.setY(scale(channelValues[CHANNEL_Y1]));
+      } else {
+        translation.setY(0);
+      }
+
+      if (channelValues[CHANNEL_X1] > centers[0].x - STICK_DEADBAND ||
+          channelValues[CHANNEL_X1] < centers[0].x + STICK_DEADBAND) {
+        translation.setX(scale(channelValues[CHANNEL_X1]));
+      } else {
+        translation.setX(0);
+      }
+
+      // EVERY_N_SECONDS(5) {
+      //   char buffer[128];
+      //   sprintf(buffer, "%d %d %d %d", rotation.pitch, rotation.yaw,
+      //           translation.X, translation.Y);
+      //   kerbal.printToKSP(buffer, PRINT_TO_SCREEN);
+      // }
+
+      kerbal.send(ROTATION_MESSAGE, rotation);
+      kerbal.send(TRANSLATION_MESSAGE, translation);
+
+      // memcpy(&previousValues, channelValues, sizeof(previousValues));
+
       const open_font &f = MicroGrotesk;
       char buffer[32];
       const float scale = f.scale(14);
 
-      sprintf(buffer, "%d %d", channelValues[0], channelValues[1]);
+      sprintf(buffer, "Alt- %.0f", altitude);
 
       lcd.suspend();
 
@@ -265,7 +317,7 @@ void loop() {
       draw::text(lcd, textPos, spoint16::zero(), buffer, f, scale,
                  lcd_color::white);
 
-      sprintf(buffer, "%d %d", channelValues[2], channelValues[3]);
+      sprintf(buffer, "Vel- %.0f", surfaceVelocity);
 
       textRect = srect16(
           spoint16::zero(),
@@ -275,9 +327,6 @@ void loop() {
                  lcd_color::white);
 
       lcd.resume();
-
-      delay(25);
-      channel = 0;
     }
 
     adc.startADCReading(muxChannels[channel], false);
